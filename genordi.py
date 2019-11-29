@@ -31,11 +31,13 @@ def parse_args():
         help='input read alignment, default: stdin')
     arg('-o', '--output', type=argparse.FileType('w'), default=sys.stdout,
         help=('output profile, format: gene <tab> count, default: stdout'))
-    arg('-g', '--genetab', required=True,
+    arg('-g', '--genetab', type=argparse.FileType('rt'),
         help=('table of gene coordinates on genome sequences'))
-    arg('-f', '--format', choices=['b6', 'sam'], default='b6',
-        help=('format of read alignment: b6: BLAST tabular format (-outfmt 6) '
-              '(default), sam: SAM format'))
+    arg('-f', '--format', choices=['auto', 'b6o', 'sam', 'map'],
+        default='auto',
+        help=('format of read alignment: "auto": automatic determination '
+              '(default), "b6o": BLAST tabular format (-outfmt 6), "sam": SAM '
+              'format, "map": read-to-gene(s) map'))
     arg('-t', '--threshold', type=float, default=0.8,
         help=('minimum ratio of overlap length vs. alignment length to '
               'qualify for a match, default: 0.8'))
@@ -68,27 +70,18 @@ def main():
     # parser arguments
     args = parse_args()
 
-    # whether return read map or simple counts (latter saves compute)
-    ismap = args.outmap or args.ambiguity != 'all'
-
-    # determine parser
-    if args.format == 'b6':  # BLAST format
-        parser = parse_b6_line
-    elif args.format == 'sam':  # SAM format
-        parser = parse_sam_line
-    else:
-        logging.error('Invalid format: {}.'.format(args.format))
-        sys.exit(1)
+    # whether return read map or gene counts (latter saves compute)
+    ismap = args.outmap or args.format == 'map' or args.ambiguity != 'all'
 
     # read gene coordinates
-    logging.info('Gene table parsing started.')
-    with open(args.genetab, 'r') as f:
-        genetab = read_gene_table(f)
-    logging.info('Gene table parsing completed.')
+    if args.genetab:
+        logging.info('Gene table parsing started.')
+        genetab = read_gene_table(args.genetab)
 
-    # sort gene coordinates per nucleotide
-    for gene, queue in genetab.items():
-        genetab[gene] = sorted(queue, key=lambda x: x[0])
+        # sort gene coordinates per nucleotide
+        for gene, queue in genetab.items():
+            genetab[gene] = sorted(queue, key=lambda x: x[0])
+        logging.info('Gene table parsing completed.')
 
     # gene profile to be constructed
     profile = {}
@@ -107,7 +100,7 @@ def main():
     # associate reads with genes for current chunck
     def _match_reads_genes():
         nonlocal rids, lenmap, locmap
-        rmap = {}
+        readmap = {}
         for nucl, loci in locmap.items():
 
             # merge and sort coordinates
@@ -128,7 +121,7 @@ def main():
 
             # merge into master read map (of current chunck)
             if args.outmap:
-                add_match_to_readmap(rmap, res, pref)
+                add_match_to_readmap(readmap, res, pref)
 
             # merge into master profile (of entire sample)
             else:
@@ -136,17 +129,57 @@ def main():
 
         # write read map
         if args.outmap:
-            logging.info('Mapped reads: {}.'.format(len(rmap)))
+            logging.info('Mapped reads: {}.'.format(len(readmap)))
             for i, rid in enumerate(rids):
                 try:
                     args.output.write('{}\t{}\n'.format(rid, ','.join(sorted(
-                        rmap[i]))))
+                        readmap[i]))))
                 except KeyError:
                     pass
 
         # free memory
         lenmap, locmap = {}, {}
         logging.info('Parsed {} lines.'.format(ii))
+
+    # parser for read-to-gene(s) map
+    def _parse_map_line(line, *args):
+        nonlocal profile, rids
+        rid, genes = line.rstrip('\r\n').split('\t')
+        rix = len(rids)
+        rids.append(rid)
+        for gene in genes.split(','):
+            profile.setdefault(gene, []).append(rix)
+
+    # determine parser
+    def _assign_parser(fmt):
+        """Assign parser function based on format code.
+        """
+        if fmt == 'map':  # read-to-gene(s) map
+            return _parse_map_line
+        if fmt == 'b6o':  # BLAST format
+            return parse_b6o_line
+        elif args.format == 'sam':  # SAM format
+            return parse_sam_line
+        else:
+            logging.error('Invalid format code: {}.'.format(args.format))
+            sys.exit(1)
+
+    # determine alignment format
+    if args.format == 'auto':  # auto-determine
+        line = args.input.readline()
+        try:
+            args.format = infer_align_format(line)
+            logging.info('Alignment format: {}.'.format(args.format))
+        except ValueError:
+            logging.error('Alignment format cannot be determined.')
+            sys.exit(1)
+        if args.format == 'map':
+            ismap = True
+        parser = _assign_parser(args.format)
+        parser(line, rids, lenmap, locmap)
+        ii += 1
+    else:
+        parser = _assign_parser(args.format)
 
     # parse read map in chuncks
     for line in args.input:
@@ -225,8 +258,44 @@ def read_gene_table(f):
     return res
 
 
-def parse_b6_line(line, rids, lenmap, locmap):
-    """Parse a line in a BLAST tabular file (b6).
+def infer_align_format(line):
+    """Guess the format of an alignment file based on first line.
+
+    Parameters
+    ----------
+    line : str
+        First line of alignment.
+
+    Returns
+    -------
+    str
+        Alignment file format (map, b6o or sam).
+
+    Raises
+    ------
+    ValueError
+        Format cannot be determined.
+
+    See Also
+    --------
+    parse_b6o_line
+    parse_sam_line
+    """
+    if line.split()[0] == '@HD':
+        return 'sam'
+    row = line.rstrip('\r\n').split('\t')
+    if len(row) == 2:
+        return 'map'
+    if len(row) == 12:
+        if all(row[i].isdigit() for i in range(3, 10)):
+            return 'b6o'
+    if len(row) >= 11:
+        if all(row[i].isdigit() for i in (1, 3, 4)):
+            return 'sam'
+
+
+def parse_b6o_line(line, rids, lenmap, locmap):
+    """Parse a line in a BLAST tabular file (b6o).
 
     Parameters
     ----------
@@ -394,9 +463,16 @@ def match_read_gene(queue, lens, th=0.8, ismap=False):
     Only one round of traversal (O(n)) of this list is needed to accurately
     find all gene-read matches.
     """
-    res = {}
+    match = {}  # read/gene match
     genes = {}  # current genes
     reads = {}  # current reads
+
+    def _add_to_match(rid, gid):
+        if ismap:
+            match.setdefault(rid, set()).add(gid)
+        else:
+            match[gid] = match.get(gid, 0) + 1
+
     for loc, is_start, is_gene, id_ in queue:
         if is_gene:
 
@@ -410,13 +486,9 @@ def match_read_gene(queue, lens, th=0.8, ismap=False):
                 # check current reads
                 for rid, rloc in reads.items():
 
-                    # if a read's overlap with the gene is long enough,
-                    # add to map
+                    # add to match if read/gene overlap is long enough
                     if loc - max(genes[id_], rloc) + 1 >= lens[rid] * th:
-                        if ismap:
-                            res.setdefault(rid, set()).add(id_)
-                        else:
-                            res[id_] = res.get(id_, 0) + 1
+                        _add_to_match(rid, id_)
 
                 # remove it from current genes
                 del(genes[id_])
@@ -428,12 +500,9 @@ def match_read_gene(queue, lens, th=0.8, ismap=False):
             else:
                 for gid, gloc in genes.items():
                     if loc - max(reads[id_], gloc) + 1 >= lens[id_] * th:
-                        if ismap:
-                            res.setdefault(id_, set()).add(gid)
-                        else:
-                            res[gid] = res.get(gid, 0) + 1
+                        _add_to_match(id_, gid)
                 del(reads[id_])
-    return res
+    return match
 
 
 def add_match_to_readmap(readmap, match, nucl=None):
@@ -554,20 +623,20 @@ class Tests(unittest.TestCase):
             (75,  True, True, '2'), (529, False, True, '2')]}
         self.assertDictEqual(obs, exp)
 
-    def test_parse_b6_line(self):
+    def test_parse_b6o_line(self):
         rids, lenmap, locmap = [], {}, {}
-        b6 = ('S1/1	NC_123456	100	100	0	0	1	100	225	324	1.2e-30	345',
-              'S1/2	NC_123456	95	98	2	1	2	99	608	708	3.4e-20	270')
+        b6o = ('S1/1	NC_123456	100	100	0	0	1	100	225	324	1.2e-30	345',
+               'S1/2	NC_123456	95	98	2	1	2	99	608	708	3.4e-20	270')
 
         # first line
-        parse_b6_line(b6[0], rids, lenmap, locmap)
+        parse_b6o_line(b6o[0], rids, lenmap, locmap)
         self.assertListEqual(rids, ['S1/1'])
         self.assertDictEqual(lenmap, {'NC_123456': {0: 100}})
         self.assertDictEqual(locmap, {'NC_123456': [
             (225, True, False, 0), (324, False, False, 0)]})
 
         # second line
-        parse_b6_line(b6[1], rids, lenmap, locmap)
+        parse_b6o_line(b6o[1], rids, lenmap, locmap)
         self.assertListEqual(rids, ['S1/1', 'S1/2'])
         self.assertDictEqual(lenmap, {'NC_123456': {0: 100, 1: 98}})
         self.assertDictEqual(locmap, {'NC_123456': [
