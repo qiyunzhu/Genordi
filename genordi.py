@@ -9,7 +9,6 @@ __author__ = 'Qiyun Zhu'
 __license__ = 'BSD-3-Clause'
 __version__ = '0.0.1-dev'
 __email__ = 'qiyunzhu@gmail.com'
-__note__ = 'test'
 
 usage = """%(prog)s -i INPUT_ALIGN -g GENE_TABLE -o OUTPUT_PROFILE [options]"""
 
